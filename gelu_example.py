@@ -43,12 +43,12 @@ time_me(fast_gelu_2)
 # Execution time 0.004061 seconds
 # Execution time 0.003486 seconds
 
-# 很难想象 但是结果确实是这个评论给出的顺序
-
+# 这里本地实测的结果是 fast_gelu_2 < fast_gelu_1 < gelu
+# 是符合理论上的时间推测的
 
 # 再在 GPU 上测试一下
 
 
 
 # Q: ReLU 的激活有问题吗
-# 主要问题是在 [-1, 0] 这部分
+# 主要问题是在 [-1, 0] 这部分  这部分 GELU 的效果更好  因为 ReLU 在这部分会直接抹平到 0
