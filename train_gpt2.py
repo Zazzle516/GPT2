@@ -11,6 +11,7 @@ import math
 # 在子模块命名中严格遵守了 HuggingFace 原本的 weight name
 
 # Q: 目前 GPT-2 完整的结构已经实现  大约 100 行  但是 modeling_gpt2.py 的 2k+ 行代码优化了哪些地方
+# Q: 在这个 torch 实现的版本为什么会用到四个维度 ??
 
 @dataclass
 class GPTConfig:
@@ -78,6 +79,8 @@ class CausalSelfAttention(nn.Module):
         # 此时 concat_qkv 继承 x 的形状  (B, T, C)
         concat_qkv = self.c_attn(x)
         q, k, v = concat_qkv.split(self.n_embd, dim=2)
+
+# 四个维度是在这里产生的  后续其他的参数也是因为 qkv 是四个维度才会 view()  所以为什么呢
 
         # 将一个完整的 QKV 矩阵均匀的划分到每个头执行  (B, nh, T, hs)
         # 通过 transpose(1, 2) 把每个头的数据独立出来  这样才可以进行多头的并行执行
@@ -148,6 +151,7 @@ class GPT(nn.Module):
         # 映射回 embedding 矩阵得到 token
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    # 使用 classmethod 返回 GPT 的实例 module line_173
     @classmethod
     def from_pretrained(cls, model_type):
         """Load pre-trained GPT-2 model weights from huggingface"""
@@ -155,32 +159,42 @@ class GPT(nn.Module):
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
+        # 通过索引 + 字典嵌套的方式高效查找   多层 key 值索引可以考虑这种方式
         config_args = {
             'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
             'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
             'gpt-large':    dict(n_layer=36, n_head=20, n_embd=1280),
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
-
         config_args['vocab_size'] = 50257
         config_args['block_size'] = 1024
 
-        config = GPTConfig(**config_args)   # Python 中这个 ** 双指针是个什么用法
-        model = GPT(config)
+        # 使用 ** 方便传参
+        # 这里是，把这堆 config_args 的字典和 GPTConfig 合并在一起 ？ 得到 config ???
+        config = GPTConfig(**config_args)
+        model = GPT(config) # 实例化
 
+        # 这里不是自定义的参数  哪来的 .attn.bias
+        # 这个 model 和 model_hf 的区别是什么呢
         sd = model.state_dict()
+
+        # 筛选掉 attn.bias 后缀
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        # 这个访问的应该是 HF 官方的 GPT2 模型
+        model_path = "/home/zazzle/models/gpt2" + model_type
+        model_hf = GPT2LMHeadModel.from_pretrained(model_path)
         sd_hf = model_hf.state_dict()
 
+        # 同理在筛掉 .attn.masked_bias 和 .attn.bias 后缀
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
 
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
+        # 把官方的权重参数数据拷到自己的模型参数里
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
