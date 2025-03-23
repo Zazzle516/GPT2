@@ -106,7 +106,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class Block(nn.Module):
-    
+
     def __init__(self, config: GPTConfig):
         super().__init__()
         # ordered Layer
@@ -114,11 +114,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)    # Masked MHA
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-    
+
     def forward(self, x):
         # Residual_Connection_1: A 数据流串行经过 layer_norm 和 Masked MHA
         # 再与无计算的数据流 B 计算  对比原本的 Transformer 结构  能更好的传递特征
-        x = self.attn(self.ln_1(x))
+        x = x + self.attn(self.ln_1(x))
 
         # Residual_Connection_2: 同理，A 数据流串行经过 layer_norm 和 FFN
         x = x + self.mlp(self.ln_2(x))
@@ -148,12 +148,14 @@ class GPT(nn.Module):
             # 针对 Transformer 而言的最后的 layer_norm_final
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+        # [batch_size, sequence_length, n_embd]
 
         # Language Module Head 用于输出 logits 预测下一个 token 的概率
-        # 映射回 embedding 矩阵得到 token
+        # [batch_size, sequence_length, n_embd] @ [n_embd, vocab_size] 映射回 embedding 矩阵得到 token
+        # [batch_size, sequence_length, vocab_size] 下一个 token 可能是全部 token 中的哪个
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    # 使用 classmethod 返回 GPT 的实例 module line_173
+    # 使用 classmethod 返回 GPT 的实例 module line_179
     @classmethod
     def from_pretrained(cls, model_type):
         """Load pre-trained GPT-2 model weights from huggingface"""
@@ -182,7 +184,7 @@ class GPT(nn.Module):
         # 因为 HuggingFace 的 attn.bias 在 register_buffer.persistent=False 条件下并没有存储
         # 所以迁移的时候要筛选掉 Masked 部分
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # eg. line_112 => line_68
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # eg. line_114 => line_70
 
         # 得到 HF 的 GPT2 模型
         model_path = "/home/zazzle/models/" + model_type
@@ -211,5 +213,85 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+    def forward(self, idx):
+        # idx: input index
+        B, T = idx.size()   # T: Sequence Length
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        # 生成 Positional Embedding 的索引 [0, T-1]  stride 默认为 1
+        # Tip: 这里只是索引 然后通过 wpe 和 wte 提供的 embedding 方法  查找到 Huggingace 提供的权重参数
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        pos_emb = self.transformer.wpe(pos)     # [T, C]
+        tok_emb = self.transformer.wte(idx)     # [B, T, C]
+
+        # Q: 为什么这里通过相同 Embedding 结构获取到的参数形状不同呢
+        # A: 注意两个索引的区别 pos=[0, 1, ...] 一维索引      idx=[B, T] 二维索引  pos 的所有 Batch 共享相同的位置编码
+        x = tok_emb + pos_emb       # [T, C] => [B, T, C] + [B, T, C]
+
+        # 顺序执行所有的 12 个 transformer block
+        for block in self.transformer.h:
+            x = block.forward(x)    # 应该是和直接调用 block(x) 等价的 ??
+
+        # 计算映射与归一化
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        # [batch_size, sequence_length, vocab_size]
+        return logits
+
+
+# model = GPT.from_pretrained('gpt2')
+# print("sucess")
+
+num_return_sequence = 5
+max_length = 30
+
 model = GPT.from_pretrained('gpt2')
-print("sucess")
+model.eval()
+model.to('cuda')
+
+# create pre-token
+import tiktoken
+
+# 把文本转换为 token 编码
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+
+# 把 tokens 转换为 Tensor 来适配 torch  [sequence_length]
+# Tip: 这里转换的只是索引 具体的 token_feature 在 line_225
+tokens = torch.tensor(tokens, dtype=torch.long)
+
+# 1. unsqueeze(0): 在 idx=0 增加了一个维度 => 等效于 Batch=1 的输入 => 适配 Transformer 的计算形状 => line_50
+# 2. repeat(N1, N2, ..): 在idx=0, idx=1, ... 的位置上重复 Ni 次 => 让 GPT2 模型最终生成 num_return_sequence 数量的结果
+tokens = tokens.unsqueeze(0).repeat(num_return_sequence, 1)
+
+# [B=num_return_sequence(repeat)), T=sequence_lenght]  => line_218
+x = tokens.to('cuda')
+
+# generate right now  x=(B, T) B=5,T=8
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+# 每个 loop 预测一个 token 然后拼接到已有序列中
+# 每个 num_return_sequence 表示一个独立的生成序列
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x)           # [batch_size, sequence_length, vocab_size]
+        # num_return_sequence 会转换到 Batch 维度  每个 Batch 对应到一个生成序列
+        # torch.multinomial 只抽取一个就好  因为抽取次数已经通过 Batch 定义了
+        logits = logits[:, -1, :]   # [batch_size, vocab_size]  只需要最后一个 token 的概率分布来预测
+        probs = F.softmax(logits, dim=-1)
+
+        # topk_indices: 从 topk 中选出的前 50 个概率最高的 token ID
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # ix: 再从这 50 个 topk_indices 中选一个
+        ix = torch.multinomial(topk_probs, 1)
+        # xcol: 从 topk_indices 中取 ix 位置的 token ID
+        xcol = torch.gather(topk_indices, -1, ix)
+
+        x = torch.cat((x, xcol), dim=1)
+
+for i in range(num_return_sequence):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
