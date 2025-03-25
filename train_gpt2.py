@@ -128,6 +128,7 @@ class Block(nn.Module):
 class GPT(nn.Module):
 
     def __init__(self, config: GPTConfig):
+        # 如果直接传入 GPTConfig() 实例  那么 torch 会自动将这些参数随机化
         super().__init__()
         self.config = config
 
@@ -213,7 +214,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # idx: input index
         B, T = idx.size()   # T: Sequence Length
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -230,47 +231,135 @@ class GPT(nn.Module):
 
         # 顺序执行所有的 12 个 transformer block
         for block in self.transformer.h:
-            x = block.forward(x)    # 应该是和直接调用 block(x) 等价的 ??
+            x = block(x)    # 应该是和直接调用 block(x) 等价的 ??
 
         # 计算映射与归一化
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)    # (B, T, vocab_size)
 
-        # [batch_size, sequence_length, vocab_size]
-        return logits
+        loss = None
+        if targets is not None:
+            # targets [B, T]
+            # logits.view(-1, logits.size(-1)) => [B * T, vocab_size]
+            # targets.view(-1) => [B * T]
+            # cross_entropy = -log( softmax(x)[y] ) = -log( exp(x[y]) / sum(exp(x)) )
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
 
-# model = GPT.from_pretrained('gpt2')
-# print("sucess")
-
-num_return_sequence = 5
-max_length = 30
-
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
+device = 'cpu'
 
 # create pre-token
 import tiktoken
-
-# 把文本转换为 token 编码
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")
+
+# Inferance
+# {
+# num_return_sequence = 5
+# max_length = 30
+
+# tokens = enc.encode("Hello, I'm a language model,")
 
 # 把 tokens 转换为 Tensor 来适配 torch  [sequence_length]
 # Tip: 这里转换的只是索引 具体的 token_feature 在 line_225
-tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = torch.tensor(tokens, dtype=torch.long)
 
 # 1. unsqueeze(0): 在 idx=0 增加了一个维度 => 等效于 Batch=1 的输入 => 适配 Transformer 的计算形状 => line_50
 # 2. repeat(N1, N2, ..): 在idx=0, idx=1, ... 的位置上重复 Ni 次 => 让 GPT2 模型最终生成 num_return_sequence 数量的结果
-tokens = tokens.unsqueeze(0).repeat(num_return_sequence, 1)
+# tokens_idx = tokens_idx.unsqueeze(0).repeat(num_return_sequence, 1)
 
 # [B=num_return_sequence(repeat)), T=sequence_lenght]  => line_218
-x = tokens.to('cuda')
+# x = tokens_idx.to(device)
 
 # generate right now  x=(B, T) B=5,T=8
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+
+# model = GPT.from_pretrained('gpt2')
+# model.eval()
+# model.to(device)
+# }
+
+# Single Train
+# {
+# 把文本转换为 token 编码
+# with open('DataSets/input.txt', 'r') as f:
+#     text = f.read()
+# text = text[:1000]
+# tokens_idx = enc.encode(text)
+
+# 定义 view 形状
+B, T = 4, 32
+
+# 把 tokens_idx 转换为 Tensor 来适配 torch  [sequence_length]
+# Tip: 这里转换的只是索引 具体的 token_feature 在 line_225
+# tokens_idx = torch.tensor(tokens_idx[:B * T + 1], dtype=torch.long)
+# 必须手动获得在新内存上的指针
+# tokens_idx = tokens_idx.to(device)
+
+# 根据训练和预测不同的用途  进行偏移
+# 此时学习前 1000 个词  只能得到过拟合的状态
+# train_idx = tokens_idx[:-1].view(B, T)
+# pred_idx = tokens_idx[1:].view(B, T)
+
+# logits, loss = model(train_idx, pred_idx)
+# print(loss)
+# }
+
+# Batch Train
+# {
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # 加载完整的训练数据
+        with open('DataSets/input.txt', 'r') as f:
+            text = f.read()
+        # enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loade {len(self.tokens)} tokens")                   # 打印 tokens 的总数
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")   # 单个 epoch 中的 token 数量
+
+        # 初始化起始位置为 0
+        self.current_position = 0
+    
+    def next_batch(self):
+        # Tip: 注意这里需要预读一个 token
+        B, T = self.B, self.T
+        tokens_idx = self.tokens[self.current_position : self.current_position + B * T + 1]
+        train_idx = (tokens_idx[:-1]).view(B, T)
+        pred_idx = (tokens_idx[1:]).view(B, T)
+
+        # 每次的 epoch 训练大小是 B*T  如果数据用完了那就循环回到开始
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return train_idx, pred_idx
+
+train_loader = DataLoaderLite(B, T)
+# }
+
+model = GPT(GPTConfig())
+model.to(device)
+
+
+# 执行梯度下降
+# Q: 这里的 Adam 和 AdamW 的区别是什么
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    train_idx, pred_idx = train_loader.next_batch()
+    train_idx = train_idx.to(device)
+    pred_idx = pred_idx.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(train_idx, pred_idx)
+    loss.backward()
+    optimizer.step()
+    print(f"train time {i}, loss: {loss.item()}")
+
+import sys; sys.exit(0)
 
 # 每个 loop 预测一个 token 然后拼接到已有序列中
 # 每个 num_return_sequence 表示一个独立的生成序列
