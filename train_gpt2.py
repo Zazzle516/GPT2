@@ -156,6 +156,9 @@ class GPT(nn.Module):
         # [batch_size, sequence_length, vocab_size] 下一个 token 可能是全部 token 中的哪个
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
     # 使用 classmethod 返回 GPT 的实例 module line_179
     @classmethod
     def from_pretrained(cls, model_type):
