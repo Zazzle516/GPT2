@@ -127,6 +127,15 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
 
+    def _init_weight(self, module):
+        # 根据 openAI 在 https://github.com/openai/gpt-2/blob/master/src/model.py 中定义的参数
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def __init__(self, config: GPTConfig):
         # 如果直接传入 GPTConfig() 实例  那么 torch 会自动将这些参数随机化
         super().__init__()
@@ -158,6 +167,9 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
+
+        # apply TF param setting
+        self.apply(self._init_weight)
 
     # 使用 classmethod 返回 GPT 的实例 module line_179
     @classmethod
