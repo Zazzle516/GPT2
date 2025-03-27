@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import time
 
 # 首先 从理论上 GPT-2 是 decoder-only model
 # 相比于原始 Transformer 有两个改动
@@ -38,6 +39,7 @@ class MLP(nn.Module):
 
         # 对应到输入的 Linear 这里是 4× 的神经元输入数量
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -74,6 +76,7 @@ class CausalSelfAttention(nn.Module):
 
         # 在把多个单头的计算输出整和到目标形状后  在内容层面赋予意义
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         B, T, C = x.size()  # C = embedding dimensions = n_head * head_size
@@ -127,6 +130,20 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
 
+    def _init_weight(self, module):
+        # 根据 openAI 在 https://github.com/openai/gpt-2/blob/master/src/model.py 中定义的参数
+        std = 0.02
+
+        # 因为一共有两次残差连接  所以有 2*
+        if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            std *= (2 * self.config.n_layer) ** -0.5
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
     def __init__(self, config: GPTConfig):
         # 如果直接传入 GPTConfig() 实例  那么 torch 会自动将这些参数随机化
         super().__init__()
@@ -158,6 +175,9 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
+
+        # apply TF param setting
+        self.apply(self._init_weight)
 
     # 使用 classmethod 返回 GPT 的实例 module line_179
     @classmethod
@@ -251,11 +271,15 @@ class GPT(nn.Module):
         return logits, loss
 
 
-device = 'cpu'
+device = 'cuda'
 
 # create pre-token
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 # Inferance
 # {
@@ -292,8 +316,8 @@ enc = tiktoken.get_encoding('gpt2')
 # text = text[:1000]
 # tokens_idx = enc.encode(text)
 
-# 定义 view 形状
-B, T = 4, 32
+# 定义 view 形状 (加油啊，4060
+B, T = 2, 1024
 
 # 把 tokens_idx 转换为 Tensor 来适配 torch  [sequence_length]
 # Tip: 这里转换的只是索引 具体的 token_feature 在 line_225
@@ -343,6 +367,9 @@ class DataLoaderLite:
         return train_idx, pred_idx
 
 train_loader = DataLoaderLite(B, T)
+
+# enable TF32
+torch.set_float32_matmul_precision('high')
 # }
 
 model = GPT(GPTConfig())
@@ -353,6 +380,8 @@ model.to(device)
 # Q: 这里的 Adam 和 AdamW 的区别是什么
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
+
     train_idx, pred_idx = train_loader.next_batch()
     train_idx = train_idx.to(device)
     pred_idx = pred_idx.to(device)
@@ -360,7 +389,12 @@ for i in range(50):
     logits, loss = model(train_idx, pred_idx)
     loss.backward()
     optimizer.step()
-    print(f"train time {i}, loss: {loss.item()}")
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"train time {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f} tk")
 
 import sys; sys.exit(0)
 
