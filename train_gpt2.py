@@ -94,14 +94,20 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Y = QK^T / sqrt(d_k)  d_k = head_size
-        # 注意在计算 QK^T 的时候  K 张量需要转置  所以这里要交换 (-2, -1) 的位置
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    # 普通的 attn 线性计算
+    # {
+        # # Y = QK^T / sqrt(d_k)  d_k = head_size
+        # # 注意在计算 QK^T 的时候  K 张量需要转置  所以这里要交换 (-2, -1) 的位置
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
-        # 把 bias 中为 0 的部分变为 -inf  再经历 softmax 会变为 0
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # # 把 bias 中为 0 的部分变为 -inf  再经历 softmax 会变为 0
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v
+    # }
+    
+    # 利用 FlashAttention 完成  会利用流式的 softmax 计算来提高效率
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # 把单头的计算结果重新整合到 (B, T, C) 的形状  这里整合到 BTC 形状的前提是 T 和 n_head 的顺序
         y = y.transpose(1, 2).contiguous().view(B, T, C)
