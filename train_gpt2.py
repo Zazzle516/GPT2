@@ -375,9 +375,10 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig())
 model.to(device)
 
+# 所谓的 kernel fusion 就是把计算存储在 GPU chip 内部  在不需要数据搬运的情况下完成多个计算
+model = torch.compile(model)
 
 # 执行梯度下降
-# Q: 这里的 Adam 和 AdamW 的区别是什么
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
     t0 = time.time()
@@ -386,7 +387,11 @@ for i in range(50):
     train_idx = train_idx.to(device)
     pred_idx = pred_idx.to(device)
     optimizer.zero_grad()
-    logits, loss = model(train_idx, pred_idx)
+    
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(train_idx, pred_idx)
+        # import code; code.interact(local=locals())  # 可以暂停执行看到混合精度的状态
+        # 比如矩阵乘法会降低到 BF16 的精度  但是其他的计算不会  因为 matmul 更健壮一些其他的不行
     loss.backward()
     optimizer.step()
 
