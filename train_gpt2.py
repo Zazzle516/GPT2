@@ -378,7 +378,9 @@ train_loader = DataLoaderLite(B, T)
 torch.set_float32_matmul_precision('high')
 # }
 
-model = GPT(GPTConfig())
+# 把一个 bad number 改成可以被 2 整除的 good number 增加了内存  但是带来了计算时间的优化
+# 虽然指定了 token 的扩大  但是这些增加的内容并不会被索引到  本质仍然是 50257 个 token 数量
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 
 # 所谓的 kernel fusion 就是把计算存储在 GPU chip 内部  在不需要数据搬运的情况下完成多个计算
