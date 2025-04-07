@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import time
+import inspect
 
 # 首先 从理论上 GPT-2 是 decoder-only model
 # 相比于原始 Transformer 有两个改动
@@ -276,6 +277,40 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    # 优化器: 针对参与梯度更新 + 对模型表达有贡献的参数需要 decay
+    # 比如 bias 和 Layernorm.weight 这些  只负责正则化  对表达无影响的不需要 decay
+    # 所以只对部分参数应用 weight_decay => 手动分组
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # 筛选方式: 用维度判断不完全准确
+        # 针对 Linear.bias, layernorm 都是一维的  所以维度判断是足够的
+        # 但是 attn.bias 是二维的  不应该参与 decay  但是这里并没有额外的判断
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        # 为不需要 decay 的参数设置 weight_decay=0
+        optim_group = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        # 得到所有将 decay / non-decay参数的总数
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # 判断 AdamW 函数是否包含 fused=True 参数
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+
+        optimizer = torch.optim.AdamW(optim_group, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 
 device = 'cuda'
 
@@ -406,7 +441,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # 执行梯度下降
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for i in range(50):
     t0 = time.time()
 
