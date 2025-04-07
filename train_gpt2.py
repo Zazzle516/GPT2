@@ -261,7 +261,7 @@ class GPT(nn.Module):
 
         # 顺序执行所有的 12 个 transformer block
         for block in self.transformer.h:
-            x = block(x)    # 应该是和直接调用 block(x) 等价的 ??
+            x = block(x)    # line_171
 
         # 计算映射与归一化
         x = self.transformer.ln_f(x)
@@ -407,6 +407,12 @@ class DataLoaderLite:
             self.current_position = 0
         return train_idx, pred_idx
 
+total_batch_size = 524288
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
 train_loader = DataLoaderLite(B, T)
 
 # enable TF32
@@ -442,25 +448,29 @@ def get_lr(it):
 
 # 执行梯度下降
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
-for i in range(50):
+for step in range(max_steps):
     t0 = time.time()
-
-    train_idx, pred_idx = train_loader.next_batch()
-    train_idx = train_idx.to(device)
-    pred_idx = pred_idx.to(device)
     optimizer.zero_grad()
-    
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(train_idx, pred_idx)
-        # import code; code.interact(local=locals())  # 可以暂停执行看到混合精度的状态
-        # 比如矩阵乘法会降低到 BF16 的精度  但是其他的计算不会  因为 matmul 更健壮一些其他的不行
-    loss.backward()
+    loss_accum = 0.0
+
+    for micro_step in range(grad_accum_steps):
+        train_idx, pred_idx = train_loader.next_batch()
+        train_idx = train_idx.to(device)
+        pred_idx = pred_idx.to(device)
+
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(train_idx, pred_idx)
+            # import code; code.interact(local=locals())  # 可以暂停执行看到混合精度的状态
+            # 比如矩阵乘法会降低到 BF16 的精度  但是其他的计算不会  因为 matmul 更健壮一些其他的不行
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
 
     # 原地计算 裁剪前梯度的总范数  修改 .grad 得到的 max_norm 不超过 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
     # 根据本次迭代的下标设定学习率
-    lr = get_lr(i)
+    lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -470,7 +480,7 @@ for i in range(50):
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
