@@ -386,6 +386,25 @@ model.to(device)
 # 所谓的 kernel fusion 就是把计算存储在 GPU chip 内部  在不需要数据搬运的情况下完成多个计算
 model = torch.compile(model)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_step = 10
+max_steps = 50
+
+# 定义学习率的分段函数
+def get_lr(it):
+    # 1) 在前 warmup_step 的迭代中  从 min_lr 开始线性增长
+    if it < warmup_step:
+        return max_lr * (it + 1) / warmup_step
+    # 2) 超过总迭代次数后  稳定在 min_lr
+    if it > max_steps:
+        return min_lr
+    # 3) 在中间  学习率以 cos 的方式下降
+    decay_ratio = (it - warmup_step) / (max_steps - warmup_step)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 # 执行梯度下降
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
@@ -401,13 +420,22 @@ for i in range(50):
         # import code; code.interact(local=locals())  # 可以暂停执行看到混合精度的状态
         # 比如矩阵乘法会降低到 BF16 的精度  但是其他的计算不会  因为 matmul 更健壮一些其他的不行
     loss.backward()
+
+    # 原地计算 裁剪前梯度的总范数  修改 .grad 得到的 max_norm 不超过 1.0
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # 根据本次迭代的下标设定学习率
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
 
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"train time {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f} tk")
+    print(f"step {i:4d} | loss: {loss.item():.6f} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
